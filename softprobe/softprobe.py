@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
-from typing import Any, Mapping, MutableMapping
+from dataclasses import dataclass
+from typing import Any, Mapping
 
-from .client import Client, TransportFn
+from .client import (
+    Client,
+    SoftprobeRuntimeError,
+    SoftprobeRuntimeUnreachableError,
+    SoftprobeUnknownSessionError,
+    TransportFn,
+)
 from .core.case_lookup import (
     CapturedHit,
     CapturedResponse,
@@ -25,6 +31,26 @@ from .core.case_lookup import (
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+
+
+class SoftprobeCaseLoadError(RuntimeError):
+    """Raised when a case document cannot be loaded (file read/parse error,
+    or a non-typed runtime failure while pushing the case to the runtime).
+
+    Unknown-session and runtime-unreachable failures are re-raised as-is so
+    callers can distinguish them via ``except``.
+    """
+
+    def __init__(self, message: str, cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
+class SoftprobeCaseLookupAmbiguityError(LookupError):
+    """Raised when :meth:`SoftprobeSession.find_in_case` matches more than
+    one span. Inherits from :class:`LookupError` for backwards compatibility
+    with existing callers.
+    """
 
 
 @dataclass(frozen=True)
@@ -53,11 +79,7 @@ class Softprobe:
         transport: TransportFn | None = None,
     ) -> None:
         url = base_url or os.environ.get("SOFTPROBE_RUNTIME_URL") or DEFAULT_BASE_URL
-        self._client = Client(url, transport=transport) if transport else Client(url)
-        if transport is not None:
-            # Client() only records the transport when it is passed explicitly; the
-            # public signature keeps `transport` an optional kw to mirror the JS API.
-            self._client = Client(url, transport=transport)
+        self._client = Client(url, transport=transport)
 
     def start_session(self, *, mode: str) -> "SoftprobeSession":
         response = self._client.sessions.create(mode=mode)
@@ -89,10 +111,37 @@ class SoftprobeSession:
         return self._id
 
     def load_case_from_file(self, case_path: str) -> None:
-        with open(case_path, "r", encoding="utf-8") as f:
-            case_document = json.load(f)
+        """Read an OTLP-shaped case document from ``case_path``, push it to
+        the runtime, and keep a parsed copy in memory for :meth:`find_in_case`.
+
+        File read / JSON parse failures raise :class:`SoftprobeCaseLoadError`.
+        Runtime failures pass through their typed form (unknown-session /
+        unreachable) and are otherwise wrapped in :class:`SoftprobeCaseLoadError`.
+        """
+
+        try:
+            with open(case_path, "r", encoding="utf-8") as f:
+                case_document = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise SoftprobeCaseLoadError(
+                f"failed to load case from {case_path}", exc
+            ) from exc
+        self.load_case(case_document)
+
+    def load_case(self, case_document: Mapping[str, Any]) -> None:
+        """Push an already-parsed case document to the runtime and keep a
+        reference for :meth:`find_in_case`.
+        """
+
+        try:
+            self._client.sessions.load_case(self._id, case_document)
+        except (SoftprobeUnknownSessionError, SoftprobeRuntimeUnreachableError):
+            raise
+        except SoftprobeRuntimeError as exc:
+            raise SoftprobeCaseLoadError(
+                "failed to load case into the runtime", exc
+            ) from exc
         self._loaded_case = case_document
-        self._client.sessions.load_case(self._id, case_document)
 
     def find_in_case(
         self,
@@ -107,14 +156,81 @@ class SoftprobeSession:
     ) -> CapturedHit:
         """Pure in-memory lookup against the loaded case.
 
-        Throws :class:`RuntimeError` if no case has been loaded,
-        :class:`LookupError` for zero or multiple matches.
+        Raises :class:`SoftprobeCaseLoadError` if no case has been loaded,
+        :class:`LookupError` when zero spans match, and
+        :class:`SoftprobeCaseLookupAmbiguityError` when more than one span
+        matches.
         """
 
+        predicate, matches = self._lookup(
+            direction=direction,
+            service=service,
+            host=host,
+            host_suffix=host_suffix,
+            method=method,
+            path=path,
+            path_prefix=path_prefix,
+        )
+        if not matches:
+            raise LookupError(
+                f"find_in_case: no span in the loaded case matches "
+                f"{format_predicate(predicate)}. Check the predicate "
+                f"(direction / method / path / host) or re-capture the case."
+            )
+        if len(matches) > 1:
+            ids = ", ".join(span.get("spanId", "<unknown>") for span in matches)
+            raise SoftprobeCaseLookupAmbiguityError(
+                f"find_in_case: {len(matches)} spans match "
+                f"{format_predicate(predicate)}. Disambiguate the predicate — "
+                f"candidate span ids: {ids}."
+            )
+        (span,) = matches
+        return CapturedHit(response=response_from_span(span), span=span)
+
+    def find_all_in_case(
+        self,
+        *,
+        direction: str | None = None,
+        service: str | None = None,
+        host: str | None = None,
+        host_suffix: str | None = None,
+        method: str | None = None,
+        path: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[CapturedHit]:
+        """Return every span that matches the predicate (never raises on
+        zero matches; authors handle the empty list).
+        """
+
+        _, matches = self._lookup(
+            direction=direction,
+            service=service,
+            host=host,
+            host_suffix=host_suffix,
+            method=method,
+            path=path,
+            path_prefix=path_prefix,
+        )
+        return [
+            CapturedHit(response=response_from_span(span), span=span)
+            for span in matches
+        ]
+
+    def _lookup(
+        self,
+        *,
+        direction: str | None,
+        service: str | None,
+        host: str | None,
+        host_suffix: str | None,
+        method: str | None,
+        path: str | None,
+        path_prefix: str | None,
+    ) -> tuple[CaseSpanPredicate, list[dict[str, Any]]]:
         if self._loaded_case is None:
-            raise RuntimeError(
+            raise SoftprobeCaseLoadError(
                 "find_in_case requires a case: call load_case_from_file(path) "
-                "before find_in_case."
+                "or load_case(document) before find_in_case."
             )
 
         predicate = CaseSpanPredicate(
@@ -126,22 +242,7 @@ class SoftprobeSession:
             path=path,
             path_prefix=path_prefix,
         )
-        matches = find_spans(self._loaded_case, predicate)
-        if not matches:
-            raise LookupError(
-                f"find_in_case: no span in the loaded case matches "
-                f"{format_predicate(predicate)}. Check the predicate "
-                f"(direction / method / path / host) or re-capture the case."
-            )
-        if len(matches) > 1:
-            ids = ", ".join(span.get("spanId", "<unknown>") for span in matches)
-            raise LookupError(
-                f"find_in_case: {len(matches)} spans match "
-                f"{format_predicate(predicate)}. Disambiguate the predicate — "
-                f"candidate span ids: {ids}."
-            )
-        (span,) = matches
-        return CapturedHit(response=response_from_span(span), span=span)
+        return predicate, find_spans(self._loaded_case, predicate)
 
     def mock_outbound(
         self,
@@ -182,18 +283,28 @@ class SoftprobeSession:
 
     def clear_rules(self) -> None:
         self._rules = []
-        self._client._post_json(  # type: ignore[attr-defined]
-            f"/v1/sessions/{self._id}/rules",
-            {"version": 1, "rules": []},
+        self._client.sessions.update_rules(
+            self._id, {"version": 1, "rules": []}
         )
+
+    def set_policy(self, policy_document: Mapping[str, Any]) -> None:
+        """Push a policy document to ``POST /v1/sessions/{id}/policy``."""
+
+        self._client.sessions.set_policy(self._id, policy_document)
+
+    def set_auth_fixtures(self, fixtures_document: Mapping[str, Any]) -> None:
+        """Push an auth fixtures document to
+        ``POST /v1/sessions/{id}/fixtures/auth``.
+        """
+
+        self._client.sessions.set_auth_fixtures(self._id, fixtures_document)
 
     def close(self) -> None:
         self._client.sessions.close(self._id)
 
     def _sync_rules(self) -> None:
-        self._client._post_json(  # type: ignore[attr-defined]
-            f"/v1/sessions/{self._id}/rules",
-            {"version": 1, "rules": self._rules},
+        self._client.sessions.update_rules(
+            self._id, {"version": 1, "rules": self._rules}
         )
 
 

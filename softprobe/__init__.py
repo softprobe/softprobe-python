@@ -1,6 +1,16 @@
-from .client import Client, SoftprobeRuntimeError
+from .client import (
+    Client,
+    SoftprobeRuntimeError,
+    SoftprobeRuntimeUnreachableError,
+    SoftprobeUnknownSessionError,
+)
 from .core.case_lookup import CapturedHit, CapturedResponse, CaseSpanPredicate
-from .softprobe import Softprobe, SoftprobeSession
+from .softprobe import (
+    Softprobe,
+    SoftprobeCaseLoadError,
+    SoftprobeCaseLookupAmbiguityError,
+    SoftprobeSession,
+)
 
 __all__ = [
     "CapturedHit",
@@ -8,6 +18,10 @@ __all__ = [
     "CaseSpanPredicate",
     "Client",
     "Softprobe",
+    "SoftprobeCaseLoadError",
+    "SoftprobeCaseLookupAmbiguityError",
     "SoftprobeRuntimeError",
+    "SoftprobeRuntimeUnreachableError",
     "SoftprobeSession",
+    "SoftprobeUnknownSessionError",
 ]

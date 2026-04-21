@@ -6,7 +6,14 @@ import tempfile
 import unittest
 from typing import Any
 
-from softprobe import Softprobe, SoftprobeSession
+from softprobe import (
+    Softprobe,
+    SoftprobeCaseLoadError,
+    SoftprobeCaseLookupAmbiguityError,
+    SoftprobeRuntimeUnreachableError,
+    SoftprobeSession,
+    SoftprobeUnknownSessionError,
+)
 
 
 def _make_case(spans: list[dict[str, Any]]) -> dict[str, Any]:
@@ -98,6 +105,13 @@ class FakeTransport:
                 ),
             }
         if url.endswith("/rules"):
+            return {
+                "status": 200,
+                "body": json.dumps(
+                    {"sessionId": "sess_py", "sessionRevision": len(self.calls)}
+                ),
+            }
+        if url.endswith("/policy") or url.endswith("/fixtures/auth"):
             return {
                 "status": 200,
                 "body": json.dumps(
@@ -418,6 +432,178 @@ class FindInCaseTests(unittest.TestCase):
             direction="outbound", method="GET", path="/legacy"
         )
         self.assertEqual(hit.response.body, "legacy-body")
+
+
+class ParitySurfaceTests(unittest.TestCase):
+    """Covers the P4.6b parity surface: `load_case`, `find_all_in_case`,
+    `set_policy`, `set_auth_fixtures`, and typed error classes.
+    """
+
+    def _softprobe_with(self, transport: FakeTransport) -> Softprobe:
+        return Softprobe(base_url="http://runtime.test", transport=transport)
+
+    def test_load_case_accepts_document_in_memory(self) -> None:
+        transport = FakeTransport()
+        session = self._softprobe_with(transport).start_session(mode="replay")
+        case_doc = _make_case(
+            [
+                _span(
+                    trace_id="t1",
+                    span_id="s1",
+                    direction="outbound",
+                    method="GET",
+                    url_path="/fragment",
+                    status=200,
+                    body='{"dep":"ok"}',
+                )
+            ]
+        )
+
+        session.load_case(case_doc)
+
+        load_call = transport.calls[-1]
+        self.assertTrue(load_call["url"].endswith("/load-case"))
+        self.assertEqual(json.loads(load_call["body"] or "{}"), case_doc)
+        hit = session.find_in_case(direction="outbound", path="/fragment")
+        self.assertEqual(hit.response.body, '{"dep":"ok"}')
+
+    def test_find_all_in_case_returns_every_match(self) -> None:
+        transport = FakeTransport()
+        session = self._softprobe_with(transport).start_session(mode="replay")
+        case_doc = _make_case(
+            [
+                _span(
+                    trace_id="t1",
+                    span_id="span-a",
+                    direction="outbound",
+                    method="GET",
+                    url_path="/fragment",
+                    status=200,
+                    body='{"dep":"one"}',
+                ),
+                _span(
+                    trace_id="t1",
+                    span_id="span-b",
+                    direction="outbound",
+                    method="GET",
+                    url_path="/fragment",
+                    status=200,
+                    body='{"dep":"two"}',
+                    span_type="extract",
+                ),
+            ]
+        )
+        session.load_case(case_doc)
+
+        hits = session.find_all_in_case(direction="outbound", path="/fragment")
+
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(
+            [h.response.body for h in hits],
+            ['{"dep":"one"}', '{"dep":"two"}'],
+        )
+
+    def test_set_policy_posts_document(self) -> None:
+        transport = FakeTransport()
+        session = self._softprobe_with(transport).start_session(mode="replay")
+
+        session.set_policy({"externalHttp": "strict"})
+
+        policy_call = transport.calls[-1]
+        self.assertTrue(policy_call["url"].endswith("/policy"))
+        self.assertEqual(
+            json.loads(policy_call["body"] or "{}"), {"externalHttp": "strict"}
+        )
+
+    def test_set_auth_fixtures_posts_document(self) -> None:
+        transport = FakeTransport()
+        session = self._softprobe_with(transport).start_session(mode="replay")
+
+        session.set_auth_fixtures({"tokens": ["t1"]})
+
+        fixtures_call = transport.calls[-1]
+        self.assertTrue(fixtures_call["url"].endswith("/fixtures/auth"))
+        self.assertEqual(
+            json.loads(fixtures_call["body"] or "{}"), {"tokens": ["t1"]}
+        )
+
+    def test_runtime_unreachable_raises_typed_error(self) -> None:
+        def unreachable(method, url, headers, body):  # type: ignore[no-untyped-def]
+            raise OSError("connect ECONNREFUSED")
+
+        softprobe = Softprobe(
+            base_url="http://runtime.test", transport=unreachable
+        )
+        with self.assertRaises(SoftprobeRuntimeUnreachableError):
+            softprobe.start_session(mode="replay")
+
+    def test_unknown_session_raises_typed_error(self) -> None:
+        def transport(method, url, headers, body):  # type: ignore[no-untyped-def]
+            if url.endswith("/v1/sessions"):
+                return {
+                    "status": 200,
+                    "body": json.dumps(
+                        {"sessionId": "sess_missing", "sessionRevision": 0}
+                    ),
+                }
+            return {
+                "status": 404,
+                "body": json.dumps(
+                    {
+                        "error": {
+                            "code": "unknown_session",
+                            "message": "unknown session",
+                        }
+                    }
+                ),
+            }
+
+        softprobe = Softprobe(base_url="http://runtime.test", transport=transport)
+        session = softprobe.start_session(mode="replay")
+        with self.assertRaises(SoftprobeUnknownSessionError):
+            session.close()
+
+    def test_case_load_error_for_invalid_file(self) -> None:
+        transport = FakeTransport()
+        session = self._softprobe_with(transport).start_session(mode="replay")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_path = os.path.join(tmp, "invalid.case.json")
+            with open(bad_path, "w", encoding="utf-8") as f:
+                f.write('{"version":')
+
+            with self.assertRaises(SoftprobeCaseLoadError):
+                session.load_case_from_file(bad_path)
+
+    def test_case_lookup_ambiguity_is_typed(self) -> None:
+        transport = FakeTransport()
+        session = self._softprobe_with(transport).start_session(mode="replay")
+        session.load_case(
+            _make_case(
+                [
+                    _span(
+                        trace_id="t1",
+                        span_id="span-a",
+                        direction="outbound",
+                        method="GET",
+                        url_path="/fragment",
+                        status=200,
+                    ),
+                    _span(
+                        trace_id="t1",
+                        span_id="span-b",
+                        direction="outbound",
+                        method="GET",
+                        url_path="/fragment",
+                        status=200,
+                        span_type="extract",
+                    ),
+                ]
+            )
+        )
+
+        with self.assertRaises(SoftprobeCaseLookupAmbiguityError):
+            session.find_in_case(direction="outbound", path="/fragment")
 
 
 if __name__ == "__main__":
