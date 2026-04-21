@@ -77,9 +77,10 @@ class Softprobe:
         base_url: str | None = None,
         *,
         transport: TransportFn | None = None,
+        api_token: str | None = None,
     ) -> None:
         url = base_url or os.environ.get("SOFTPROBE_RUNTIME_URL") or DEFAULT_BASE_URL
-        self._client = Client(url, transport=transport)
+        self._client = Client(url, transport=transport, api_token=api_token)
 
     def start_session(self, *, mode: str) -> "SoftprobeSession":
         response = self._client.sessions.create(mode=mode)

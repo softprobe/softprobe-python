@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Callable, TypedDict
 from urllib import request as urllib_request
 from urllib.error import HTTPError
@@ -84,17 +85,38 @@ class _SessionsClient:
 class Client:
     """Thin HTTP client for the Softprobe control runtime."""
 
-    def __init__(self, base_url: str, transport: TransportFn | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        transport: TransportFn | None = None,
+        *,
+        api_token: str | None = None,
+    ) -> None:
+        """Initialize a control-runtime client.
+
+        :param api_token: Bearer token sent as ``Authorization: Bearer <token>``
+            on every request. When ``None``, falls back to the
+            ``SOFTPROBE_API_TOKEN`` environment variable. When both are empty
+            or whitespace, no Authorization header is sent — matching the
+            runtime's "auth disabled by default" story (see
+            ``softprobe-runtime/internal/controlapi.withOptionalBearerAuth``).
+        """
         self._base_url = base_url.rstrip("/")
         self._transport = transport or _default_transport
+        self._api_token = api_token
         self.sessions = _SessionsClient(self)
 
     def _post_json(self, path: str, body: Any) -> dict[str, Any]:
+        headers: dict[str, str] = {"content-type": "application/json"}
+        token = _resolve_bearer_token(self._api_token)
+        if token is not None:
+            headers["authorization"] = f"Bearer {token}"
+
         try:
             response = self._transport(
                 "POST",
                 f"{self._base_url}{path}",
-                {"content-type": "application/json"},
+                headers,
                 json.dumps(body),
             )
         except (SoftprobeRuntimeError, SoftprobeRuntimeUnreachableError):
@@ -108,6 +130,14 @@ class Client:
         if status < 200 or status >= 300:
             raise _classify_runtime_error(status, response["body"])
         return json.loads(response["body"])
+
+
+def _resolve_bearer_token(explicit: str | None) -> str | None:
+    candidate = explicit if explicit is not None else os.environ.get("SOFTPROBE_API_TOKEN")
+    if candidate is None:
+        return None
+    trimmed = candidate.strip()
+    return trimmed or None
 
 
 def _classify_runtime_error(status: int, body: str) -> SoftprobeRuntimeError:

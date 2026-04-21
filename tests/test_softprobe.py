@@ -606,5 +606,36 @@ class ParitySurfaceTests(unittest.TestCase):
             session.find_in_case(direction="outbound", path="/fragment")
 
 
+class FacadeApiTokenTests(unittest.TestCase):
+    """Verifies the Softprobe facade threads ``api_token`` through to every
+    runtime call (session start, rules sync, close). Mirrors the TS facade
+    test in ``softprobe-js/src/__tests__/softprobe.test.ts``.
+    """
+
+    def test_api_token_is_attached_on_every_facade_call(self) -> None:
+        transport = FakeTransport()
+        softprobe = Softprobe(
+            base_url="http://runtime.test",
+            transport=transport,
+            api_token="sp_facade_token",
+        )
+        session = softprobe.start_session(mode="replay")
+        session.mock_outbound(
+            direction="outbound",
+            host="api.stripe.com",
+            path="/v1/payment_intents",
+            response={"status": 200, "body": {"ok": True}},
+        )
+        session.close()
+
+        self.assertGreaterEqual(len(transport.calls), 3)
+        for call in transport.calls:
+            self.assertEqual(
+                call["headers"].get("authorization"),
+                "Bearer sp_facade_token",
+                msg=f"call to {call['url']} missing bearer header",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,7 @@
 import json
+import os
 import unittest
+from unittest import mock
 
 from softprobe.client import Client, SoftprobeRuntimeError
 
@@ -65,6 +67,64 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status, 404)
         self.assertEqual(ctx.exception.body, '{"error":"unknown session"}')
+
+
+class BearerTokenAuthenticationTests(unittest.TestCase):
+    """Mirrors softprobe-js/src/__tests__/runtime-client.test.ts: the Python SDK
+    must attach ``Authorization: Bearer $SOFTPROBE_API_TOKEN`` on every call
+    when a token is configured, matching the runtime's
+    ``withOptionalBearerAuth`` contract.
+    """
+
+    def _recording_transport(self, calls: list[dict[str, object]]):
+        def transport(method: str, url: str, headers: dict[str, str], body: str | None) -> dict[str, object]:
+            calls.append({"method": method, "url": url, "headers": dict(headers), "body": body})
+            return {"status": 200, "body": json.dumps({"sessionId": "s", "sessionRevision": 0})}
+
+        return transport
+
+    def test_attaches_bearer_from_explicit_api_token_argument(self) -> None:
+        calls: list[dict[str, object]] = []
+        client = Client(
+            "http://runtime.test",
+            transport=self._recording_transport(calls),
+            api_token="sp_explicit_token",
+        )
+        client.sessions.create(mode="replay")
+        self.assertEqual(calls[0]["headers"].get("authorization"), "Bearer sp_explicit_token")
+
+    def test_falls_back_to_softprobe_api_token_env_var(self) -> None:
+        calls: list[dict[str, object]] = []
+        with mock.patch.dict(os.environ, {"SOFTPROBE_API_TOKEN": "sp_env_token"}, clear=False):
+            client = Client("http://runtime.test", transport=self._recording_transport(calls))
+            client.sessions.create(mode="replay")
+        self.assertEqual(calls[0]["headers"].get("authorization"), "Bearer sp_env_token")
+
+    def test_api_token_argument_overrides_env_var(self) -> None:
+        calls: list[dict[str, object]] = []
+        with mock.patch.dict(os.environ, {"SOFTPROBE_API_TOKEN": "sp_env_token"}, clear=False):
+            client = Client(
+                "http://runtime.test",
+                transport=self._recording_transport(calls),
+                api_token="sp_explicit_wins",
+            )
+            client.sessions.create(mode="replay")
+        self.assertEqual(calls[0]["headers"].get("authorization"), "Bearer sp_explicit_wins")
+
+    def test_sends_no_authorization_header_when_unconfigured(self) -> None:
+        calls: list[dict[str, object]] = []
+        env = {k: v for k, v in os.environ.items() if k != "SOFTPROBE_API_TOKEN"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            client = Client("http://runtime.test", transport=self._recording_transport(calls))
+            client.sessions.create(mode="replay")
+        self.assertNotIn("authorization", calls[0]["headers"])
+
+    def test_treats_whitespace_token_as_no_token(self) -> None:
+        calls: list[dict[str, object]] = []
+        with mock.patch.dict(os.environ, {"SOFTPROBE_API_TOKEN": "   "}, clear=False):
+            client = Client("http://runtime.test", transport=self._recording_transport(calls), api_token="")
+            client.sessions.create(mode="replay")
+        self.assertNotIn("authorization", calls[0]["headers"])
 
 
 if __name__ == "__main__":
