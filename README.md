@@ -85,3 +85,7 @@ drives this SDK against the compose stack in [`e2e/`](../e2e/).
 
 The `softprobe` command lives in [`softprobe-runtime/`](../softprobe-runtime/),
 not in this package. This SDK only speaks the JSON control API over HTTP.
+
+## License
+
+Apache-2.0. See [`LICENSE`](./LICENSE) and the monorepo [`LICENSING.md`](../LICENSING.md) for the full dual-license map (server components are under the Softprobe Source License 1.0).
