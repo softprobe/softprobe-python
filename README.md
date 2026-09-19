@@ -1,3 +1,14 @@
+> **Archived.** This repository was the Softprobe **Hybrid / replay** Python SDK.
+> It is no longer maintained.
+>
+> For Softprobe **Agent QA** (LLM observability) — `pip install softprobe`,
+> LangChain, OTLP → Explorer — use:
+> **https://github.com/softprobe/softprobe-py**
+>
+> Hybrid/replay Python support is not published from this repo.
+
+---
+
 # softprobe (Python SDK)
 
 Python SDK for the **Softprobe Hybrid** platform. It talks HTTP to
